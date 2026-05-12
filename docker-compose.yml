@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: smartoshxona_bot
+    restart: always
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    networks:
+      - botnet
+
+  nginx:
+    image: nginx:alpine
+    container_name: smartoshxona_nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - bot
+    networks:
+      - botnet
+
+networks:
+  botnet:
+    driver: bridge
