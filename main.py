@@ -31,17 +31,26 @@ conn = sqlite3.connect("data/oshxona.db")
 cursor = conn.cursor()
 
 cursor.execute("""
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL
+)
+""")
+
+cursor.execute("""
 CREATE TABLE IF NOT EXISTS products (
     name TEXT PRIMARY KEY,
     price INTEGER,
     stock INTEGER,
-    img TEXT
+    img TEXT,
+    category TEXT
 )
 """)
-try:
-    cursor.execute("ALTER TABLE products ADD COLUMN img TEXT")
-except sqlite3.OperationalError:
-    pass
+for col in ("img", "category"):
+    try:
+        cursor.execute(f"ALTER TABLE products ADD COLUMN {col} TEXT")
+    except sqlite3.OperationalError:
+        pass
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS orders (
@@ -52,25 +61,32 @@ CREATE TABLE IF NOT EXISTS orders (
     status TEXT
 )
 """)
-conn.commit()
 
-for name, price, stock in [
-    ("Osh", 30000, 10), ("Manti", 8000, 10),
-    ("Sho'rva", 35000, 10), ("Tort", 15000, 10), ("Cola", 8000, 10),
-]:
+# Seed kategoriyalar
+_DEFAULT_CATS = ["🍛 Quyuq taom", "🍲 Suyuq taom", "🍰 Shirinliklar", "🥤 Ichimliklar"]
+for _c in _DEFAULT_CATS:
+    cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (_c,))
+
+# Seed mahsulotlar
+_DEFAULT_PRODUCTS = [
+    ("Osh",    30000, 10, "🍛 Quyuq taom"),
+    ("Manti",   8000, 10, "🍛 Quyuq taom"),
+    ("Sho'rva", 35000, 10, "🍲 Suyuq taom"),
+    ("Tort",   15000, 10, "🍰 Shirinliklar"),
+    ("Cola",    8000, 10, "🥤 Ichimliklar"),
+]
+for _n, _p, _s, _cat in _DEFAULT_PRODUCTS:
     cursor.execute(
-        "INSERT OR IGNORE INTO products (name, price, stock) VALUES (?,?,?)",
-        (name, price, stock),
+        "INSERT OR IGNORE INTO products (name, price, stock, category) VALUES (?,?,?,?)",
+        (_n, _p, _s, _cat),
     )
-conn.commit()
+    # Mavjud mahsulotlarga kategoriya yozish (eski qatorlar uchun)
+    cursor.execute(
+        "UPDATE products SET category=? WHERE name=? AND category IS NULL",
+        (_cat, _n),
+    )
 
-MENU = {
-    "🍛 Quyuq taom": ["Osh", "Manti"],
-    "🍲 Suyuq taom": ["Sho'rva"],
-    "🍰 Shirinliklar": ["Tort"],
-    "🥤 Ichimliklar": ["Cola"],
-}
-CATEGORY_KEYS = list(MENU.keys())
+conn.commit()
 
 cart = {}
 user_quantity = {}   # {(user_id, name): qty}
@@ -78,30 +94,66 @@ user_selected = {}   # {user_id: name}
 user_cat_msg = {}    # {user_id: (message_id, is_photo)}
 
 
+# ---------------- DB HELPERS ----------------
+def get_categories() -> list[str]:
+    cursor.execute("SELECT name FROM categories ORDER BY id")
+    return [r[0] for r in cursor.fetchall()]
+
+
+def db_items(category_name: str) -> list[tuple]:
+    cursor.execute(
+        "SELECT name, price FROM products WHERE category=?", (category_name,)
+    )
+    return cursor.fetchall()
+
+
+def find_cat(item_name: str) -> str | None:
+    cursor.execute("SELECT category FROM products WHERE name=?", (item_name,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def db_img(name: str) -> str | None:
+    cursor.execute("SELECT img FROM products WHERE name=?", (name,))
+    row = cursor.fetchone()
+    return row[0] if row and row[0] else None
+
+
 # ---------------- FSM ----------------
 class AdminState(StatesGroup):
-    add_name   = State()
-    add_price  = State()
-    add_stock  = State()
-    add_cat    = State()
-    add_img    = State()
+    # Mahsulot qo'shish
+    add_name  = State()
+    add_price = State()
+    add_stock = State()
+    add_cat   = State()
+    add_img   = State()
+    # Kategoriya qo'shish
+    new_cat_name = State()
+    # Kategoriya tahrirlash
+    edit_cat_select = State()
+    edit_cat_name   = State()
+    # Kategoriya o'chirish
+    del_cat_select  = State()
+    # Mahsulot tahrirlash
     edit_select = State()
     edit_field  = State()
     edit_value  = State()
-    del_select  = State()
-    edit_name  = State()   # narx o'zgartirish uchun (eski)
+    # Mahsulot o'chirish
+    del_select = State()
+    # (eski holatlar, saqlab qolindi)
+    edit_name  = State()
     edit_price = State()
-    img_name   = State()
-    img_photo  = State()
 
 
 # ---------------- KEYBOARDS ----------------
 def main_kb(is_admin=False):
-    rows = [
-        [KeyboardButton(text="🍛 Quyuq taom"),  KeyboardButton(text="🍲 Suyuq taom")],
-        [KeyboardButton(text="🍰 Shirinliklar"), KeyboardButton(text="🥤 Ichimliklar")],
-        [KeyboardButton(text="🛒 Savatcha"),     KeyboardButton(text="📦 Buyurtmalarim")],
-    ]
+    cats = get_categories()
+    rows = []
+    # Kategoriyalarni 2 tadan qator qilib joylash
+    for i in range(0, len(cats), 2):
+        pair = cats[i:i+2]
+        rows.append([KeyboardButton(text=c) for c in pair])
+    rows.append([KeyboardButton(text="🛒 Savatcha"), KeyboardButton(text="📦 Buyurtmalarim")])
     if is_admin:
         rows.append([KeyboardButton(text="⚙️ Admin panel")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -109,32 +161,34 @@ def main_kb(is_admin=False):
 
 def admin_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="➕ Mahsulot qo'shish"), KeyboardButton(text="✏️ Mahsulot tahrirlash")],
-        [KeyboardButton(text="🖼 Rasm qo'shish"),     KeyboardButton(text="🗑 Mahsulot o'chirish")],
-        [KeyboardButton(text="📦 Ombor"),             KeyboardButton(text="🔙 Orqaga")],
+        [KeyboardButton(text="➕ Mahsulot qo'shish"),    KeyboardButton(text="✏️ Mahsulot tahrirlash")],
+        [KeyboardButton(text="🗑 Mahsulot o'chirish"),   KeyboardButton(text="📦 Ombor")],
+        [KeyboardButton(text="📂 Kategoriya qo'shish"),  KeyboardButton(text="✏️ Kategoriya tahrirlash")],
+        [KeyboardButton(text="🗑 Kategoriya o'chirish"), KeyboardButton(text="🔙 Orqaga")],
     ], resize_keyboard=True)
 
 
-def category_kb(user_id, items_prices, selected=None):
-    rows = []
-    for name, price in items_prices:
-        tick = "✅" if name == selected else "🍽"
-        rows.append([InlineKeyboardButton(
-            text=f"{tick} {name} — {price:,} so'm",
-            callback_data=f"sel|{name}",
-        )])
-    if selected:
-        qty = user_quantity.get((user_id, selected), 1)
-        rows.append([
-            InlineKeyboardButton(text="➖", callback_data=f"minus|{selected}"),
-            InlineKeyboardButton(text=f"  {qty} dona  ", callback_data="noop"),
-            InlineKeyboardButton(text="➕", callback_data=f"plus|{selected}"),
-        ])
-        rows.append([InlineKeyboardButton(
-            text=f"🛒 Savatga qo'shish — {selected}",
-            callback_data=f"add|{selected}",
-        )])
+def category_kb(items_prices):
+    """Kategoriya ro'yxati — barcha mahsulotlar."""
+    rows = [[InlineKeyboardButton(
+        text=f"🍽 {name} — {price:,} so'm",
+        callback_data=f"sel|{name}",
+    )] for name, price in items_prices]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def item_kb(user_id, name, cat):
+    """Tanlangan mahsulot ko'rinishi — faqat shu mahsulot."""
+    qty = user_quantity.get((user_id, name), 1)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➖", callback_data=f"minus|{name}"),
+            InlineKeyboardButton(text=f"  {qty} dona  ", callback_data="noop"),
+            InlineKeyboardButton(text="➕", callback_data=f"plus|{name}"),
+        ],
+        [InlineKeyboardButton(text="🛒 Savatga qo'shish", callback_data=f"add|{name}")],
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"back|{cat}")],
+    ])
 
 
 # ---------------- START ----------------
@@ -147,29 +201,6 @@ async def cmd_start(message: Message):
 
 
 # ---------------- HELPERS ----------------
-def db_items(category_name):
-    result = []
-    for name in MENU.get(category_name, []):
-        cursor.execute("SELECT price FROM products WHERE name=?", (name,))
-        row = cursor.fetchone()
-        if row:
-            result.append((name, row[0]))
-    return result
-
-
-def find_cat(item_name):
-    for cat, items in MENU.items():
-        if item_name in items:
-            return cat
-    return None
-
-
-def db_img(name):
-    cursor.execute("SELECT img FROM products WHERE name=?", (name,))
-    row = cursor.fetchone()
-    return row[0] if row and row[0] else None
-
-
 async def delete_cat_msg(user_id):
     entry = user_cat_msg.pop(user_id, None)
     if entry:
@@ -179,8 +210,12 @@ async def delete_cat_msg(user_id):
             pass
 
 
-# ---------------- CATEGORY ----------------
-@dp.message(F.text.in_(CATEGORY_KEYS))
+# ---------------- CATEGORY (dinamik filter) ----------------
+async def _is_category(message: Message) -> bool:
+    return message.text in get_categories()
+
+
+@dp.message(_is_category)
 async def show_category(message: Message):
     cat = message.text
     items = db_items(cat)
@@ -191,7 +226,7 @@ async def show_category(message: Message):
     user_selected.pop(uid, None)
     await delete_cat_msg(uid)
     text = f"{cat}\n{'─'*28}\nTaomni tanlang 👇"
-    sent = await message.answer(text, reply_markup=category_kb(uid, items))
+    sent = await message.answer(text, reply_markup=category_kb(items))
     user_cat_msg[uid] = (sent.message_id, False)
 
 
@@ -203,32 +238,15 @@ async def select_item(callback: CallbackQuery):
     user_selected[uid] = name
 
     cat = find_cat(name)
-    items = db_items(cat) if cat else []
-    kb = category_kb(uid, items, selected=name)
+    kb = item_kb(uid, name, cat)
     img = db_img(name)
 
-    entry = user_cat_msg.get(uid)
-    caption = f"{cat}\n{'─'*28}\n🍽 {name} tanlandi 👇"
+    cursor.execute("SELECT price FROM products WHERE name=?", (name,))
+    row = cursor.fetchone()
+    price_text = f"{row[0]:,} so'm" if row else ""
+    caption = f"🍽 {name}\n💰 {price_text}"
 
     if img:
-        if entry and entry[1]:
-            # Allaqachon foto xabar — mediasini va keyboardini yangilash
-            try:
-                await bot.edit_message_media(
-                    chat_id=callback.message.chat.id,
-                    message_id=entry[0],
-                    media=InputMediaPhoto(media=img, caption=caption),
-                )
-                await bot.edit_message_reply_markup(
-                    chat_id=callback.message.chat.id,
-                    message_id=entry[0],
-                    reply_markup=kb,
-                )
-                await callback.answer()
-                return
-            except Exception:
-                pass
-        # Matn xabarni o'chirib, foto xabar yuborish
         await delete_cat_msg(uid)
         sent = await bot.send_photo(
             callback.message.chat.id, img,
@@ -236,9 +254,23 @@ async def select_item(callback: CallbackQuery):
         )
         user_cat_msg[uid] = (sent.message_id, True)
     else:
-        # Rasm yo'q — faqat keyboard yangilash
-        await callback.message.edit_reply_markup(reply_markup=kb)
+        await callback.message.edit_text(caption, reply_markup=kb)
+        user_cat_msg[uid] = (callback.message.message_id, False)
 
+    await callback.answer()
+
+
+# ---------------- BACK TO CATEGORY ----------------
+@dp.callback_query(F.data.startswith("back|"))
+async def back_to_category(callback: CallbackQuery):
+    cat = callback.data.split("|", 1)[1]
+    uid = callback.from_user.id
+    items = db_items(cat)
+    text = f"{cat}\n{'─'*28}\nTaomni tanlang 👇"
+
+    await delete_cat_msg(uid)
+    sent = await callback.message.answer(text, reply_markup=category_kb(items))
+    user_cat_msg[uid] = (sent.message_id, False)
     await callback.answer()
 
 
@@ -246,17 +278,17 @@ async def select_item(callback: CallbackQuery):
 async def update_qty_kb(callback: CallbackQuery, name: str):
     uid = callback.from_user.id
     cat = find_cat(name)
-    items = db_items(cat) if cat else []
-    kb = category_kb(uid, items, selected=name)
+    kb = item_kb(uid, name, cat)
     entry = user_cat_msg.get(uid)
-    if entry:
+    msg_id = entry[0] if entry else callback.message.message_id
+    try:
         await bot.edit_message_reply_markup(
             chat_id=callback.message.chat.id,
-            message_id=entry[0],
+            message_id=msg_id,
             reply_markup=kb,
         )
-    else:
-        await callback.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
 
 
 @dp.callback_query(F.data.startswith("plus|"))
@@ -338,7 +370,7 @@ async def make_order(callback: CallbackQuery):
     await bot.send_message(uid, "💳 Karta: 8600 1234 5678 0000\n📤 Chek rasmini yuboring")
 
 
-# ---------------- PAYMENT CHECK (foydalanuvchi) ----------------
+# ---------------- PAYMENT CHECK ----------------
 @dp.message(F.photo, StateFilter(None))
 async def payment_check(message: Message):
     uid = message.from_user.id
@@ -352,44 +384,6 @@ async def payment_check(message: Message):
     ])
     await bot.send_photo(ADMIN_ID, message.photo[-1].file_id,
                          caption=f"User: {uid}", reply_markup=kb)
-
-
-# ---------------- ADMIN: RASM QO'SHISH ----------------
-@dp.message(F.text == "🖼 Rasm qo'shish")
-async def img_start(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    cursor.execute("SELECT name FROM products")
-    names = [r[0] for r in cursor.fetchall()]
-    await message.answer("Qaysi mahsulotga rasm qo'shmoqchisiz?\n\n" + "\n".join(f"• {n}" for n in names))
-    await state.set_state(AdminState.img_name)
-
-
-@dp.message(AdminState.img_name)
-async def img_name_handler(message: Message, state: FSMContext):
-    cursor.execute("SELECT name FROM products WHERE name=?", (message.text,))
-    if not cursor.fetchone():
-        await message.answer("❌ Bunday mahsulot yo'q. Ro'yxatdan tanlang:")
-        return
-    await state.update_data(img_name=message.text)
-    await message.answer(f"✅ '{message.text}' tanlandi.\nEndi rasmni yuboring:")
-    await state.set_state(AdminState.img_photo)
-
-
-@dp.message(AdminState.img_photo, F.photo)
-async def img_photo_handler(message: Message, state: FSMContext):
-    data = await state.get_data()
-    name = data["img_name"]
-    file_id = message.photo[-1].file_id
-    cursor.execute("UPDATE products SET img=? WHERE name=?", (file_id, name))
-    conn.commit()
-    await message.answer(f"✅ '{name}' uchun rasm saqlandi!", reply_markup=admin_kb())
-    await state.clear()
-
-
-@dp.message(AdminState.img_photo)
-async def img_photo_wrong(message: Message):
-    await message.answer("❌ Iltimos rasm yuboring (fayl emas).")
 
 
 # ---------------- ACCEPT / READY ----------------
@@ -431,6 +425,131 @@ async def admin_panel(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
     await message.answer("⚙️ Admin panel", reply_markup=admin_kb())
+
+
+# ---- KATEGORIYA QO'SHISH ----
+@dp.message(F.text == "📂 Kategoriya qo'shish")
+async def add_cat_start(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    cats = get_categories()
+    cats_text = "\n".join(f"• {c}" for c in cats)
+    await message.answer(
+        f"Mavjud kategoriyalar:\n{cats_text}\n\n"
+        "Yangi kategoriya nomini yozing (masalan: 🥗 Salatlar):"
+    )
+    await state.set_state(AdminState.new_cat_name)
+
+
+@dp.message(AdminState.new_cat_name)
+async def add_cat_name_h(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if not name:
+        await message.answer("❌ Bo'm-bo'sh nom bo'lmaydi. Qaytadan yozing:")
+        return
+    cursor.execute("SELECT name FROM categories WHERE name=?", (name,))
+    if cursor.fetchone():
+        await message.answer(f"❌ '{name}' kategoriyasi allaqachon mavjud. Boshqa nom yozing:")
+        return
+    cursor.execute("INSERT INTO categories (name) VALUES (?)", (name,))
+    conn.commit()
+    await message.answer(
+        f"✅ '{name}' kategoriyasi qo'shildi!\n\n"
+        "Endi foydalanuvchilar asosiy menyuda bu kategoriyani ko'radi.",
+        reply_markup=admin_kb(),
+    )
+    await state.clear()
+
+
+# ---- KATEGORIYA TAHRIRLASH ----
+def cats_manage_kb(prefix: str):
+    cats = get_categories()
+    btns = [[InlineKeyboardButton(text=c, callback_data=f"{prefix}|{c}")] for c in cats]
+    btns.append([InlineKeyboardButton(text="❌ Bekor", callback_data="catcancel")])
+    return InlineKeyboardMarkup(inline_keyboard=btns)
+
+
+@dp.message(F.text == "✏️ Kategoriya tahrirlash")
+async def edit_cat_start(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("Tahrirlamoqchi bo'lgan kategoriyani tanlang:", reply_markup=cats_manage_kb("editcat"))
+    await state.set_state(AdminState.edit_cat_select)
+
+
+@dp.callback_query(AdminState.edit_cat_select, F.data.startswith("editcat|"))
+async def edit_cat_select_h(callback: CallbackQuery, state: FSMContext):
+    cat = callback.data.split("|", 1)[1]
+    await state.update_data(old_cat=cat)
+    await callback.message.edit_text(f"'{cat}' uchun yangi nomni yozing:")
+    await state.set_state(AdminState.edit_cat_name)
+    await callback.answer()
+
+
+@dp.message(AdminState.edit_cat_name)
+async def edit_cat_name_h(message: Message, state: FSMContext):
+    new_name = message.text.strip()
+    if not new_name:
+        await message.answer("❌ Bo'm-bo'sh nom bo'lmaydi:")
+        return
+    data = await state.get_data()
+    old_cat = data["old_cat"]
+    cursor.execute("SELECT name FROM categories WHERE name=?", (new_name,))
+    if cursor.fetchone():
+        await message.answer(f"❌ '{new_name}' allaqachon mavjud. Boshqa nom yozing:")
+        return
+    cursor.execute("UPDATE categories SET name=? WHERE name=?", (new_name, old_cat))
+    cursor.execute("UPDATE products SET category=? WHERE category=?", (new_name, old_cat))
+    conn.commit()
+    await message.answer(f"✅ '{old_cat}' → '{new_name}' ga o'zgartirildi.", reply_markup=admin_kb())
+    await state.clear()
+
+
+@dp.callback_query(F.data == "catcancel")
+async def cat_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Bekor qilindi.")
+    await callback.answer()
+
+
+# ---- KATEGORIYA O'CHIRISH ----
+def confirm_del_cat_kb(cat: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Ha, o'chir", callback_data=f"delcatconfirm|{cat}")],
+        [InlineKeyboardButton(text="❌ Yo'q",       callback_data="catcancel")],
+    ])
+
+
+@dp.message(F.text == "🗑 Kategoriya o'chirish")
+async def del_cat_start(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("O'chirmoqchi bo'lgan kategoriyani tanlang:", reply_markup=cats_manage_kb("delcat"))
+    await state.set_state(AdminState.del_cat_select)
+
+
+@dp.callback_query(AdminState.del_cat_select, F.data.startswith("delcat|"))
+async def del_cat_select_h(callback: CallbackQuery, state: FSMContext):
+    cat = callback.data.split("|", 1)[1]
+    cursor.execute("SELECT COUNT(*) FROM products WHERE category=?", (cat,))
+    count = cursor.fetchone()[0]
+    warning = f"\n⚠️ Bu kategoriyada {count} ta mahsulot bor, ular kategoriyasiz qoladi." if count else ""
+    await callback.message.edit_text(
+        f"'{cat}' kategoriyasini o'chirishni tasdiqlaysizmi?{warning}",
+        reply_markup=confirm_del_cat_kb(cat),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("delcatconfirm|"))
+async def del_cat_confirm_h(callback: CallbackQuery, state: FSMContext):
+    cat = callback.data.split("|", 1)[1]
+    cursor.execute("UPDATE products SET category=NULL WHERE category=?", (cat,))
+    cursor.execute("DELETE FROM categories WHERE name=?", (cat,))
+    conn.commit()
+    await state.clear()
+    await callback.message.edit_text(f"🗑 '{cat}' kategoriyasi o'chirildi.")
+    await callback.answer()
 
 
 # ---- MAHSULOT TAHRIRLASH ----
@@ -516,11 +635,6 @@ async def edit_value_text(message: Message, state: FSMContext):
     if field == "nom":
         cursor.execute("UPDATE products SET name=? WHERE name=?", (message.text, name))
         conn.commit()
-        # MENU ni yangilash
-        for cat in MENU:
-            if name in MENU[cat]:
-                MENU[cat][MENU[cat].index(name)] = message.text
-                break
         await message.answer(f"✅ Nom: {name} → {message.text}", reply_markup=admin_kb())
 
     elif field == "narx":
@@ -585,10 +699,6 @@ async def del_confirmed(callback: CallbackQuery, state: FSMContext):
     name = callback.data.split("|")[1]
     cursor.execute("DELETE FROM products WHERE name=?", (name,))
     conn.commit()
-    for cat in MENU:
-        if name in MENU[cat]:
-            MENU[cat].remove(name)
-            break
     await state.clear()
     await callback.message.edit_text(f"🗑 '{name}' o'chirildi.")
     await callback.answer()
@@ -602,6 +712,12 @@ async def del_cancel(callback: CallbackQuery, state: FSMContext):
 
 
 # ---- MAHSULOT QO'SHISH ----
+def cats_inline_kb():
+    cats = get_categories()
+    btns = [[InlineKeyboardButton(text=c, callback_data=f"pickcat|{c}")] for c in cats]
+    return InlineKeyboardMarkup(inline_keyboard=btns)
+
+
 @dp.message(F.text == "➕ Mahsulot qo'shish")
 async def add_prod_start(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
@@ -633,23 +749,25 @@ async def add_stock_h(message: Message, state: FSMContext):
         await message.answer("❌ Faqat raqam:")
         return
     await state.update_data(stock=int(message.text))
-    cats = "\n".join(f"{i+1}. {k}" for i, k in enumerate(CATEGORY_KEYS))
-    await message.answer(f"Kategoriyani tanlang:\n\n{cats}\n\nRaqamini yozing (1-{len(CATEGORY_KEYS)}):")
+    await message.answer("Kategoriyani tanlang:", reply_markup=cats_inline_kb())
     await state.set_state(AdminState.add_cat)
 
 
-@dp.message(AdminState.add_cat)
-async def add_cat_h(message: Message, state: FSMContext):
-    if not message.text.isdigit() or not (1 <= int(message.text) <= len(CATEGORY_KEYS)):
-        await message.answer(f"❌ 1 dan {len(CATEGORY_KEYS)} gacha raqam yozing:")
-        return
-    await state.update_data(cat=CATEGORY_KEYS[int(message.text) - 1])
+@dp.callback_query(AdminState.add_cat, F.data.startswith("pickcat|"))
+async def add_cat_pick_h(callback: CallbackQuery, state: FSMContext):
+    cat = callback.data.split("|", 1)[1]
+    await state.update_data(cat=cat)
+    await callback.message.edit_text(f"✅ Kategoriya: {cat}")
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="⏭ O'tkazib yuborish")]],
         resize_keyboard=True,
     )
-    await message.answer("Mahsulot rasmini yuboring:\n(Rasm bo'lmasa — O'tkazib yuborish)", reply_markup=kb)
+    await callback.message.answer(
+        "Mahsulot rasmini yuboring:\n(Rasm bo'lmasa — O'tkazib yuborish)",
+        reply_markup=kb,
+    )
     await state.set_state(AdminState.add_img)
+    await callback.answer()
 
 
 @dp.message(AdminState.add_img, F.photo)
@@ -657,12 +775,14 @@ async def add_img_photo_h(message: Message, state: FSMContext):
     data = await state.get_data()
     file_id = message.photo[-1].file_id
     cursor.execute(
-        "INSERT OR IGNORE INTO products (name, price, stock, img) VALUES (?,?,?,?)",
-        (data["name"], data["price"], data["stock"], file_id),
+        "INSERT OR IGNORE INTO products (name, price, stock, img, category) VALUES (?,?,?,?,?)",
+        (data["name"], data["price"], data["stock"], file_id, data["cat"]),
     )
     conn.commit()
-    MENU[data["cat"]].append(data["name"])
-    await message.answer(f"✅ {data['name']} → {data['cat']} ga qo'shildi (rasm bilan)", reply_markup=admin_kb())
+    await message.answer(
+        f"✅ {data['name']} → {data['cat']} ga qo'shildi (rasm bilan)",
+        reply_markup=admin_kb(),
+    )
     await state.clear()
 
 
@@ -670,12 +790,14 @@ async def add_img_photo_h(message: Message, state: FSMContext):
 async def add_img_skip_h(message: Message, state: FSMContext):
     data = await state.get_data()
     cursor.execute(
-        "INSERT OR IGNORE INTO products (name, price, stock) VALUES (?,?,?)",
-        (data["name"], data["price"], data["stock"]),
+        "INSERT OR IGNORE INTO products (name, price, stock, category) VALUES (?,?,?,?)",
+        (data["name"], data["price"], data["stock"], data["cat"]),
     )
     conn.commit()
-    MENU[data["cat"]].append(data["name"])
-    await message.answer(f"✅ {data['name']} → {data['cat']} ga qo'shildi (rasmsiz)", reply_markup=admin_kb())
+    await message.answer(
+        f"✅ {data['name']} → {data['cat']} ga qo'shildi (rasmsiz)",
+        reply_markup=admin_kb(),
+    )
     await state.clear()
 
 
@@ -689,10 +811,12 @@ async def add_img_wrong_h(message: Message):
 async def show_stock(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
-    cursor.execute("SELECT name, price, stock, img FROM products")
+    cursor.execute("SELECT name, price, stock, img, category FROM products")
     rows = cursor.fetchall()
-    lines = [f"{'✅' if img else '❌'} {n} | {p:,} so'm | {s} dona"
-             for n, p, s, img in rows]
+    lines = [
+        f"{'✅' if img else '❌'} {n} | {p:,} so'm | {s} dona | {cat or '—'}"
+        for n, p, s, img, cat in rows
+    ]
     await message.answer("\n".join(lines) or "Bo'sh")
 
 
